@@ -87,7 +87,7 @@ static int build_program(AVFilterContext *ctx) {
   GenericShaderContext *gs = ctx->priv;
 
   if (!((v_shader = build_shader(ctx, v_shader_source, GL_VERTEX_SHADER)) &&
-        (f_shader = build_shader(ctx, f_shader_source, GL_FRAGMENT_SHADER))) {
+        (f_shader = build_shader(ctx, f_shader_source, GL_FRAGMENT_SHADER)))) {
     return -1;
   }
 
@@ -109,7 +109,7 @@ static int config_props(AVFilterLink *inlink) {
   AVFilterContext     *ctx = inlink->dst;
   GenericShaderContext *gs = ctx->priv;
 
-  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+  glfwWindowHint(GLFW_VISIBLE, 0);
   gs->window = glfwCreateWindow(inlink->w, inlink->h, "", NULL, NULL);
 
   glfwMakeContextCurrent(gs->window);
