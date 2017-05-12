@@ -43,6 +43,7 @@ typedef struct {
   const AVClass *class;
   GLuint        program;
   GLuint        tex[3];
+  GLuint        pbo_in;
   GLFWwindow    *window;
   GLuint        pos_buf;
 } GenericShaderContext;
@@ -82,6 +83,17 @@ static void vbo_setup(GenericShaderContext *gs) {
   GLint loc = glGetAttribLocation(gs->program, "position");
   glEnableVertexAttribArray(loc);
   glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+}
+
+static void pbo_setup(AVFilterLink *inlink) {
+  AVFilterContext     *ctx = inlink->dst;
+  GenericShaderContext *gs = ctx->priv;
+
+  glGenBuffers(1, &gs->pbo_in);
+
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gs->pbo_in);
+  glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*1.5, 0, GL_STREAM_DRAW);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
 static void tex_setup(AVFilterLink *inlink) {
@@ -152,9 +164,25 @@ static int config_props(AVFilterLink *inlink) {
   }
 
   glUseProgram(gs->program);
+  pbo_setup(inlink);
   vbo_setup(gs);
   tex_setup(inlink);
   return 0;
+}
+
+static void input_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo) {
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+  glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w * inlink->h * 1.5, 0, GL_STREAM_DRAW);
+  GLubyte *ptr = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+
+  memcpy(ptr, in->data[0], inlink->w * inlink->h);
+  ptr += inlink->w * inlink->h;
+  memcpy(ptr, in->data[1], inlink->w/2 * inlink->h/2);
+  ptr += inlink->w/2 * inlink->h/2;
+  memcpy(ptr, in->data[2], inlink->w/2 * inlink->h/2);
+
+  glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
@@ -169,15 +197,21 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
   }
   av_frame_copy_props(out, in);
 
+  input_frame(inlink, in, gs->pbo_in);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gs->pbo_in);
+
+  int w, h, offset = 0;
   for(int i = 0; i < 3; i++) {
     glActiveTexture(GL_TEXTURE0 + i);
     glBindTexture(GL_TEXTURE_2D, gs->tex[i]);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, in->linesize[i]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                    inlink->w / (i ? 2 : 1),
-                    inlink->h / (i ? 2 : 1),
-                    PIXEL_FORMAT, GL_UNSIGNED_BYTE, in->data[i]);
+                    w = inlink->w / (i ? 2 : 1),
+                    h = inlink->h / (i ? 2 : 1),
+                    PIXEL_FORMAT, GL_UNSIGNED_BYTE, offset);
+    offset += w * h;
   }
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   glDrawArrays(GL_TRIANGLES, 0, 6);
   glReadPixels(0, 0, outlink->w, outlink->h, GL_RGB, GL_UNSIGNED_BYTE, (GLvoid *)out->data[0]);
