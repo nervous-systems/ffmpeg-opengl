@@ -219,7 +219,7 @@ static void process_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo_in, GLui
   glDrawArrays(GL_TRIANGLES, 0, 6);
 
   glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_out);
-  glReadPixels(0, 0, inlink->w, inlink->h, GL_BGR, GL_UNSIGNED_BYTE, 0);
+  glReadPixels(0, 0, inlink->w, inlink->h, GL_RGB, GL_UNSIGNED_BYTE, 0);
 
   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
@@ -278,7 +278,7 @@ static int query_formats(AVFilterContext *ctx) {
     return ret;
   }
   formats = NULL;
-  if ((ret = ff_add_format(&formats, AV_PIX_FMT_BGR24)) < 0 ||
+  if ((ret = ff_add_format(&formats, AV_PIX_FMT_RGB24)) < 0 ||
       (ret = ff_formats_ref(formats, &ctx->outputs[0]->in_formats)) < 0) {
     return ret;
   }
