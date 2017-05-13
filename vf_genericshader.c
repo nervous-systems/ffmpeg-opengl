@@ -14,20 +14,30 @@ static const float position[12] = {
 
 static const GLchar *v_shader_source =
   "attribute vec2 position;\n"
-  "varying vec2 texCoord;\n"
+  "varying vec2 tex_coord;\n"
   "void main(void) {\n"
   "  gl_Position = vec4(position, 0, 1);\n"
-  "  texCoord = position;\n"
+  "  tex_coord = position * 0.5 + 0.5;\n"
   "}\n";
 
 static const GLchar *f_shader_source =
-  "uniform sampler2D tex;\n"
-  "varying vec2 texCoord;\n"
+  "uniform sampler2D tex_y;\n"
+  "uniform sampler2D tex_u;\n"
+  "uniform sampler2D tex_v;\n"
+  "varying vec2 tex_coord;\n"
+  "const mat3 bt601_coeff = mat3(1.164,1.164,1.164,0.0,-0.392,2.017,1.596,-0.813,0.0);\n"
+  "const vec3 offsets     = vec3(-0.0625, -0.5, -0.5);\n"
+  "vec3 sampleRgb(vec2 loc) {\n"
+  "  float y = texture2D(tex_y, loc).r;\n"
+  "  float u = texture2D(tex_u, loc).r;\n"
+  "  float v = texture2D(tex_v, loc).r;\n"
+  "  return bt601_coeff * (vec3(y, u, v) + offsets);\n"
+  "}\n"
   "void main() {\n"
-  "  gl_FragColor = texture2D(tex, texCoord * 0.5 + 0.5);\n"
+  "  gl_FragColor = vec4(sampleRgb(tex_coord), 1.);\n"
   "}\n";
 
-#define PIXEL_FORMAT GL_RGB
+#define PIXEL_FORMAT GL_RED
 #define OUTPUT_BUFFERS 2
 #define INPUT_BUFFERS  2
 
@@ -36,7 +46,7 @@ typedef struct {
   GLuint        program;
   GLuint        pbo_in[INPUT_BUFFERS];
   GLuint        pbo_out[OUTPUT_BUFFERS];
-  GLuint        frame_tex;
+  GLuint        tex[3];
   AVFrame       *last;
   int           frame_idx;
   GLFWwindow    *window;
@@ -67,7 +77,7 @@ static void pbo_setup(AVFilterLink *inlink) {
   glGenBuffers(INPUT_BUFFERS, gs->pbo_in);
   for(int i = 0; i < INPUT_BUFFERS; i++) {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gs->pbo_in[i]);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*3, 0, GL_STREAM_DRAW);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*1.5, 0, GL_STREAM_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
   }
 
@@ -93,18 +103,24 @@ static void tex_setup(AVFilterLink *inlink) {
   AVFilterContext     *ctx = inlink->dst;
   GenericShaderContext *gs = ctx->priv;
 
-  glGenTextures(1, &gs->frame_tex);
-  glActiveTexture(GL_TEXTURE0);
+  glGenTextures(3, gs->tex);
 
-  glBindTexture(GL_TEXTURE_2D, gs->frame_tex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  for(int i = 0; i < 3; i++) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, gs->tex[i]);
 
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, inlink->w, inlink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-  glUniform1i(glGetUniformLocation(gs->program, "tex"), 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+                 inlink->w / (i ? 2 : 1),
+                 inlink->h / (i ? 2 : 1),
+                 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, NULL);
+  }
+
+  glUniform1i(glGetUniformLocation(gs->program, "tex_y"), 0);
+  glUniform1i(glGetUniformLocation(gs->program, "tex_u"), 1);
+  glUniform1i(glGetUniformLocation(gs->program, "tex_v"), 2);
 }
 
 static int build_program(AVFilterContext *ctx) {
@@ -162,9 +178,13 @@ static int config_props(AVFilterLink *inlink) {
 
 static void input_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo) {
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-  //glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*3, 0, GL_STREAM_DRAW);
+
   GLubyte *ptr = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
-  memcpy(ptr, in->data[0], inlink->w*inlink->h*3);
+  memcpy(ptr, in->data[0], inlink->w*inlink->h);
+  ptr += inlink->w * inlink->h;
+  memcpy(ptr, in->data[1], inlink->w/2 * inlink->h/2);
+  ptr += inlink->w/2 * inlink->h/2;
+  memcpy(ptr, in->data[2], inlink->w/2 * inlink->h/2);
 
   glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -174,17 +194,25 @@ static void process_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo_in, GLui
   AVFilterContext     *ctx = inlink->dst;
   GenericShaderContext *gs = ctx->priv;
 
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, gs->frame_tex);
+  int w, h, offset = 0;
+  for(int i = 0; i < 3; i++) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, gs->tex[i]);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_in);
 
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_in);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, inlink->w, inlink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, 0);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, in->linesize[i]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                    w = inlink->w / (i ? 2 : 1),
+                    h = inlink->h / (i ? 2 : 1),
+                    PIXEL_FORMAT, GL_UNSIGNED_BYTE, offset);
+    offset += w * h;
+  }
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   glDrawArrays(GL_TRIANGLES, 0, 6);
 
   glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_out);
-  glReadPixels(0, 0, inlink->w, inlink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, 0);
+  glReadPixels(0, 0, inlink->w, inlink->h, GL_RGB, GL_UNSIGNED_BYTE, 0);
 
   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
@@ -208,6 +236,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
   AVFilterLink    *outlink = ctx->outputs[0];
   GenericShaderContext *gs = ctx->priv;
 
+  AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+  av_frame_copy_props(out, in);
+
   input_frame(inlink, in, gs->pbo_in[gs->frame_idx % INPUT_BUFFERS]);
   process_frame(inlink, in,
                 gs->pbo_in[gs->frame_idx % INPUT_BUFFERS],
@@ -218,7 +249,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
     ret = output_frame(inlink, gs->last, gs->pbo_out[(gs->frame_idx-1) % OUTPUT_BUFFERS]);
   }
 
-  gs->last = in;
+  av_frame_free(&in);
+  gs->last = out;
   gs->frame_idx++;
 
   return ret;
@@ -226,15 +258,25 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
 
 static av_cold void uninit(AVFilterContext *ctx) {
   GenericShaderContext *gs = ctx->priv;
-  glDeleteTextures(1, &gs->frame_tex);
+  glDeleteTextures(3, gs->tex);
   glDeleteProgram(gs->program);
   glDeleteBuffers(1, &gs->pos_buf);
   glfwDestroyWindow(gs->window);
 }
 
 static int query_formats(AVFilterContext *ctx) {
-  static const enum AVPixelFormat formats[] = {AV_PIX_FMT_RGB24, AV_PIX_FMT_NONE};
-  return ff_set_common_formats(ctx, ff_make_format_list(formats));
+  AVFilterFormats *formats = NULL;
+  int ret;
+  if ((ret = ff_add_format(&formats, AV_PIX_FMT_YUV420P)) < 0 ||
+      (ret = ff_formats_ref(formats, &ctx->inputs[0]->out_formats)) < 0) {
+    return ret;
+  }
+  formats = NULL;
+  if ((ret = ff_add_format(&formats, AV_PIX_FMT_RGB24)) < 0 ||
+      (ret = ff_formats_ref(formats, &ctx->outputs[0]->in_formats)) < 0) {
+    return ret;
+  }
+  return 0;
 }
 
 static const AVFilterPad genericshader_inputs[] = {
