@@ -44,7 +44,9 @@ typedef struct {
   AVFrame       *last;
   GLuint        program;
   GLuint        tex[3];
+  GLuint        tex_out;
   GLuint        pbo_in[3];
+  GLuint        fb;
   GLuint        pbo_out[2];
   int           frame_idx;
   GLFWwindow    *window;
@@ -112,6 +114,7 @@ static void tex_setup(AVFilterLink *inlink) {
   AVFilterContext     *ctx = inlink->dst;
   GenericShaderContext *gs = ctx->priv;
 
+  glGenFramebuffers(1, &gs->fb);
   glGenTextures(3, gs->tex);
 
   for(int i = 0; i < 3; i++) {
@@ -130,6 +133,15 @@ static void tex_setup(AVFilterLink *inlink) {
   glUniform1i(glGetUniformLocation(gs->program, "tex_y"), 0);
   glUniform1i(glGetUniformLocation(gs->program, "tex_u"), 1);
   glUniform1i(glGetUniformLocation(gs->program, "tex_v"), 2);
+
+  glGenTextures(1, &gs->tex_out);
+  glActiveTexture(GL_TEXTURE4);
+  glBindTexture(GL_TEXTURE_2D, gs->tex_out);
+
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, inlink->w, inlink->h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
 }
 
 static int build_program(AVFilterContext *ctx) {
@@ -214,6 +226,8 @@ static void process_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo_in[], GL
   }
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
+  glBindFramebuffer(GL_FRAMEBUFFER, gs->fb);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gs->tex_out, 0);
   glDrawArrays(GL_TRIANGLES, 0, 6);
 
   glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_out);
