@@ -28,11 +28,17 @@ static const GLchar *f_shader_source =
   "}\n";
 
 #define PIXEL_FORMAT GL_RGB
+#define OUTPUT_BUFFERS 2
+#define INPUT_BUFFERS  2
 
 typedef struct {
   const AVClass *class;
   GLuint        program;
+  GLuint        pbo_in[INPUT_BUFFERS];
+  GLuint        pbo_out[OUTPUT_BUFFERS];
   GLuint        frame_tex;
+  AVFrame       *last;
+  int           frame_idx;
   GLFWwindow    *window;
   GLuint        pos_buf;
 } GenericShaderContext;
@@ -52,6 +58,25 @@ static GLuint build_shader(AVFilterContext *ctx, const GLchar *shader_source, GL
   GLint status;
   glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
   return status == GL_TRUE ? shader : 0;
+}
+
+static void pbo_setup(AVFilterLink *inlink) {
+  AVFilterContext     *ctx = inlink->dst;
+  GenericShaderContext *gs = ctx->priv;
+
+  glGenBuffers(INPUT_BUFFERS, gs->pbo_in);
+  for(int i = 0; i < INPUT_BUFFERS; i++) {
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gs->pbo_in[i]);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*3, 0, GL_STREAM_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  }
+
+  glGenBuffers(OUTPUT_BUFFERS, gs->pbo_out);
+  for(int i = 0; i < OUTPUT_BUFFERS; i++) {
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, gs->pbo_out[i]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, inlink->w*inlink->h*3, 0, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  }
 }
 
 static void vbo_setup(GenericShaderContext *gs) {
@@ -113,6 +138,8 @@ static int config_props(AVFilterLink *inlink) {
   gs->window = glfwCreateWindow(inlink->w, inlink->h, "", NULL, NULL);
 
   glfwMakeContextCurrent(gs->window);
+  gs->last = 0;
+  gs->frame_idx = 0;
 
   #ifndef __APPLE__
   glewExperimental = GL_TRUE;
@@ -128,27 +155,73 @@ static int config_props(AVFilterLink *inlink) {
 
   glUseProgram(gs->program);
   vbo_setup(gs);
+  pbo_setup(inlink);
   tex_setup(inlink);
   return 0;
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
-  AVFilterContext *ctx     = inlink->dst;
-  AVFilterLink    *outlink = ctx->outputs[0];
+static void input_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo) {
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+  //glBufferData(GL_PIXEL_UNPACK_BUFFER, inlink->w*inlink->h*3, 0, GL_STREAM_DRAW);
+  GLubyte *ptr = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+  memcpy(ptr, in->data[0], inlink->w*inlink->h*3);
 
-  AVFrame *out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-  if (!out) {
-    av_frame_free(&in);
-    return AVERROR(ENOMEM);
-  }
-  av_frame_copy_props(out, in);
+  glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
 
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, inlink->w, inlink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, in->data[0]);
+static void process_frame(AVFilterLink *inlink, AVFrame *in, GLuint pbo_in, GLuint pbo_out) {
+  AVFilterContext     *ctx = inlink->dst;
+  GenericShaderContext *gs = ctx->priv;
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, gs->frame_tex);
+
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_in);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, inlink->w, inlink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, 0);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
   glDrawArrays(GL_TRIANGLES, 0, 6);
-  glReadPixels(0, 0, outlink->w, outlink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, (GLvoid *)out->data[0]);
 
-  av_frame_free(&in);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_out);
+  glReadPixels(0, 0, inlink->w, inlink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, 0);
+
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+}
+
+static int output_frame(AVFilterLink *inlink, AVFrame *out, GLuint pbo) {
+  AVFilterContext       *ctx = inlink->dst;
+  AVFilterLink      *outlink = ctx->outputs[0];
+
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+
+  out->data[0] = (GLvoid*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+
+  glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
   return ff_filter_frame(outlink, out);
+}
+
+static int filter_frame(AVFilterLink *inlink, AVFrame *in) {
+  AVFilterContext     *ctx = inlink->dst;
+  AVFilterLink    *outlink = ctx->outputs[0];
+  GenericShaderContext *gs = ctx->priv;
+
+  input_frame(inlink, in, gs->pbo_in[gs->frame_idx % INPUT_BUFFERS]);
+  process_frame(inlink, in,
+                gs->pbo_in[gs->frame_idx % INPUT_BUFFERS],
+                gs->pbo_out[gs->frame_idx % OUTPUT_BUFFERS]);
+
+  int ret = 0;
+  if (gs->last) {
+    ret = output_frame(inlink, gs->last, gs->pbo_out[(gs->frame_idx-1) % OUTPUT_BUFFERS]);
+  }
+
+  gs->last = in;
+  gs->frame_idx++;
+
+  return ret;
 }
 
 static av_cold void uninit(AVFilterContext *ctx) {
